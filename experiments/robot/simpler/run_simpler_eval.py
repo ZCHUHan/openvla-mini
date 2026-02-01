@@ -98,6 +98,16 @@ class GenerateConfig:
     augmented_samples: int = 32
     action_server_port: int = 3200
     reward_server_port: int = 3100
+    use_stgs_refine: bool = False
+    stgs_inner_steps: int = 5
+    stgs_tau: float = 1.0
+    stgs_step_size: float = 1e-1
+    stgs_prior_weight: float = 0.0
+    stgs_anchor_weight: float = 0.0
+    stgs_init_logit_scale: float = 10.0
+    stgs_detach_each_step: bool = True
+    stgs_scorer_hidden_dim: int = 256
+    stgs_scorer_ckpt: Optional[str] = None
 
 @draccus.wrap()
 def eval_simpler(cfg: GenerateConfig) -> None:

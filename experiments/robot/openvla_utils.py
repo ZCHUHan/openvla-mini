@@ -21,6 +21,11 @@ import sys
 sys.path.append("../")
 
 from experiments.robot.token_action_converter import TokenActionConverter
+from experiments.robot.differentiable_scorer import (
+    ActionOnlyCritic,
+    check_differentiable_scorer,
+)
+from experiments.robot.st_gs_refiner import StGsConfig, refine_tokens_with_stgs
 
 
 def preprocess_actions(output_ids, action):
@@ -85,9 +90,8 @@ def get_batch_actions(instruction: str, image_path: str, batch_size: int = 4, te
         raise FileNotFoundError(f"Image not found at {image_path}")
     
     payload = {
-        "instruction": instruction,
+        "instructions": [instruction],
         "image_path": image_path,
-        "batch_size": 1,  # Always set to 1 for individual requests
         "temperature": temperature
     }
     
@@ -341,18 +345,58 @@ def get_vla_action(vla, processor, base_vla_name, obs, task_label, unnorm_key, c
     )
 
     # Preprocess initial actions
-    if cfg.initial_samples == 1 and cfg.augmented_samples == 1:
+    use_stgs_refine = bool(getattr(cfg, "use_stgs_refine", False))
+    if cfg.initial_samples == 1 and cfg.augmented_samples == 1 and not use_stgs_refine:
         return actions[0] 
     output_ids, actions = preprocess_actions(output_ids, actions)
     _, unique = get_unique_actions(output_ids, actions)
-    if len(unique)==1:
+    if len(unique) == 1 and not use_stgs_refine:
         return unique[0]
 
-    # Generate augmented samples based on the mean and variance of a batch of actions.
-    output_ids, actions = generate_augmented_samples_from_batch(
-        batch_actions=actions,
-        num_samples=cfg.augmented_samples
-    )
+    if use_stgs_refine:
+        if cfg.model_family != "openvla":
+            raise ValueError("ST-GS refine only supports OpenVLA token actions.")
+        if cfg.augmented_samples != 1:
+            print("ST-GS refine enabled; skipping Gaussian augmented_samples.")
+
+        scorer = ActionOnlyCritic(
+            action_dim=ACTION_DIM,
+            hidden_dim=int(getattr(cfg, "stgs_scorer_hidden_dim", 256)),
+        ).to(DEVICE)
+        scorer_ckpt = getattr(cfg, "stgs_scorer_ckpt", None)
+        if scorer_ckpt:
+            scorer.load_state_dict(torch.load(scorer_ckpt, map_location=DEVICE))
+        scorer.eval()
+        scorer.requires_grad_(False)
+        check_differentiable_scorer(scorer, None, torch.zeros(ACTION_DIM, device=DEVICE))
+
+        stgs_cfg = StGsConfig(
+            inner_steps=int(getattr(cfg, "stgs_inner_steps", 5)),
+            tau=float(getattr(cfg, "stgs_tau", 1.0)),
+            step_size=float(getattr(cfg, "stgs_step_size", 1e-1)),
+            prior_weight=float(getattr(cfg, "stgs_prior_weight", 0.0)),
+            anchor_weight=float(getattr(cfg, "stgs_anchor_weight", 0.0)),
+            init_logit_scale=float(getattr(cfg, "stgs_init_logit_scale", 10.0)),
+            detach_each_step=bool(getattr(cfg, "stgs_detach_each_step", True)),
+        )
+        converter = TokenActionConverter(unnorm_key=cfg.unnorm_key)
+
+        def reward_fn(a_soft):
+            return scorer(None, a_soft)
+
+        output_ids, actions = refine_tokens_with_stgs(
+            token_ids=output_ids,
+            converter=converter,
+            reward_fn=reward_fn,
+            cfg=stgs_cfg,
+            device=DEVICE,
+        )
+    else:
+        # Generate augmented samples based on the mean and variance of a batch of actions.
+        output_ids, actions = generate_augmented_samples_from_batch(
+            batch_actions=actions,
+            num_samples=cfg.augmented_samples
+        )
 
     # Score each action with robomonkey verifier
     output_ids, actions = get_unique_actions(output_ids, actions)
